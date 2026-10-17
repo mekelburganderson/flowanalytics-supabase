@@ -30,6 +30,10 @@ async function ensureIntegration(): Promise<void> {
     throw new Error("Integração inativa ou URL diferente do secret GITLAB_URL");
   }
 }
+/** Erro HTTP do GitLab com o status, para tratar 403/404 por projeto. */
+class GitLabHttpError extends Error {
+  constructor(readonly status: number, message: string) { super(message); }
+}
 async function gitlab(path: string): Promise<Response> {
   const response = await fetch(`${GITLAB_URL}/api/v4${path}`, {
     headers: { "PRIVATE-TOKEN": GITLAB_TOKEN, Accept: "application/json" },
@@ -37,7 +41,7 @@ async function gitlab(path: string): Promise<Response> {
   });
   if (!response.ok) {
     const detail = (await response.text()).slice(0, 400);
-    throw new Error(`GitLab HTTP ${response.status} em ${path}: ${detail}`);
+    throw new GitLabHttpError(response.status, `GitLab HTTP ${response.status} em ${path}: ${detail}`);
   }
   return response;
 }
@@ -120,6 +124,7 @@ Deno.serve(async (req: Request) => {
     let apiPages = 0;
     let labelsImported = 0;
     let milestonesImported = 0;
+    const skipped: Array<{ project: number; phase: string; status: number }> = [];
     const completedProjects: number[] = [];
     let currentProject: number | null = null;
     for (const project of projects) {
@@ -138,7 +143,18 @@ Deno.serve(async (req: Request) => {
         const path = phase === "labels"
           ? `/projects/${project.gitlab_id}/labels?include_ancestor_groups=true&per_page=${PER_PAGE}&page=${progress.page}`
           : `/projects/${project.gitlab_id}/milestones?include_ancestors=true&per_page=${PER_PAGE}&page=${progress.page}`;
-        const { items, next } = await getPage(path);
+        let page: { items: Item[]; next: number };
+        try {
+          page = await getPage(path);
+        } catch (e) {
+          // 403/404 por projeto (ex.: Issues desativadas bloqueiam milestones):
+          // trata como "sem itens" e segue, em vez de abortar o lote inteiro.
+          if (!(e instanceof GitLabHttpError) || (e.status !== 403 && e.status !== 404)) throw e;
+          console.warn("gitlab-import-catalog-details: ignorado", e.message);
+          skipped.push({ project: project.gitlab_id, phase, status: e.status });
+          page = { items: [], next: 0 };
+        }
+        const { items, next } = page;
         const now = new Date().toISOString();
         if (phase === "labels") {
           const rows = items.filter((l) => l?.id != null).map((l) => ({
@@ -191,6 +207,7 @@ Deno.serve(async (req: Request) => {
       project_count: projects.length, projects_completed_this_request: completedProjects,
       labels_imported: labelsImported, milestones_imported: milestonesImported,
       api_pages_processed: apiPages, current_project_gitlab_id: currentProject,
+      skipped_projects: skipped,
       complete, resume_required: !complete, duration_ms: Date.now() - started });
   } catch (error) {
     console.error("gitlab-import-catalog-details", error);
