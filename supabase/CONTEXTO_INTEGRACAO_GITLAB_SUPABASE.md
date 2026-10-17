@@ -449,7 +449,7 @@ O SQL-base define `sync_cursors_gitlab.sync_type` com quatro opções: `catalog`
 5. **Integridade multiempresa:** reforçar consistência entre `integration_id` de registros relacionados e criar FK real para a empresa.
 6. **Recortes temporais:** carga criada em 2026 é diferente de Issues fechadas em 2026; reconciliação por `updated_at` amplia a cobertura, mas **não substitui auditoria histórica completa**.
 7. **Outros eventos:** histórico de responsáveis e movimentação entre Boards não foram importados nesta estrutura.
-8. **Indicadores:** ainda não há, neste contexto, tabelas ou Edge Function definitiva de métricas calculadas; a camada de dados é o insumo para futuro cálculo de desenvolvimento, teste, retrabalho e entrega.
+8. **Indicadores:** a primeira camada de métricas é a **Visão Gerencial** (seção 9): views materializadas e RPCs `vg_*` sobre `issues_gitlab` e `label_events_gitlab`.
 9. **Validação:** testes funcionais completos, tempos reais, integridade referencial e contagens entre GitLab e Supabase devem ser confirmados na instância de produção.
 
 ## 7. Consultas operacionais (somente leitura)
@@ -519,6 +519,19 @@ ORDER BY started_at DESC LIMIT 30;
 
 > Execute as últimas duas consultas apenas **depois** de confirmar que as tabelas do orquestrador foram aplicadas.
 
+## 7.5 Verificação do ambiente em 2026-10-17 (Fase 0 da Visão Gerencial)
+
+Consultas somente leitura via `supabase db query --linked`:
+
+- Contagens: 88 grupos, 190 projetos, 133 usuários, 89 milestones, 345 labels, 3225 Issues (3070 fechadas, `closed_at` entre 2026-01-06 e 2026-10-14; 323 fechadas sem responsável), 2830 responsáveis, 6877 labels atuais, 8092 eventos (5386 add / 2706 remove).
+- `integrations_gitlab.company_id` = empresa "Inside Sistemas - FullStack" (única em `companies`).
+- CHECK de `sync_cursors_gitlab` já inclui `current_labels` (migration aplicada). Tabelas do orquestrador existem.
+- **Orquestrador nunca executado**: `orchestrator_runs_gitlab` vazia, estado em `projects`/ciclo 0, sem job de cron do orquestrador e Vault sem secrets. Os crons ativos são os antigos (`gitlab_issues_v2`, `Eventos-Git_v2`).
+- **Histórico de labels incompleto**: `label_events_synced_at` preenchido em 504 das 3070 Issues fechadas; 2695 Issues com histórico pendente e 1891 com labels atuais pendentes. `raw_payload->labels` (nomes) existe em todas as Issues.
+- `supabase db pull` não rodou: histórico remoto de migrations vazio e Docker parado. A migration da Visão Gerencial foi aplicada com `db push` e o histórico remoto passou a ter `20261016021223` (vazia) e `20261017180000`. A DDL das 14 tabelas `*_gitlab` continua não versionada.
+
+Pendências para os tempos ficarem completos (exigem decisão do responsável): `ORCH_FN_ISSUES=smooth-function`, secrets do Vault e cron do orquestrador.
+
 ## 8. Artefatos de referência e manutenção
 
 Este contexto foi derivado das seguintes entregas de código e SQL (nomes originais dos artefatos gerados, que podem ser versionados nas pastas correspondentes do repositório):
@@ -536,3 +549,13 @@ Este contexto foi derivado das seguintes entregas de código e SQL (nomes origin
 - `gitlab-sync-orchestrator-ajustado/index.ts`.
 
 **Prática recomendada:** atualizar este documento quando mudar o esquema, a regra de escopo, a posição dos checkpoints ou os contratos de retorno das Edge Functions. Em divergências, o DDL aplicado e o código efetivamente implantado são a referência operacional; este documento é um registro de arquitetura e implementação.
+
+## 9. Visão Gerencial (camada de métricas)
+
+Migration `migrations/20261017180000_visao_gerencial.sql` (aplicada em 2026-10-17). Regras de negócio no repositório do frontend (`docs/CONTEXTO_REGRAS_ESPECIFICACOES.md`, seção 2.12) e detalhes em `docs/BANCO_DE_DADOS.md`.
+
+- **Configuração**: `delivery_categories` (etapas e tipos), `delivery_category_labels` (labels por nome normalizado), `business_holidays`, `dashboard_user_preferences`. RLS por empresa; escrita Admin/Editor.
+- **Tempo útil**: `business_offset_seconds` / `business_seconds_between` (seg–sex, 08:30–18:00, `America/Sao_Paulo`, menos feriados).
+- **Views materializadas** (nível de label, sem filtro de usuário, só `service_role`): `mv_vg_issue_labels`, `mv_vg_label_cycles`, `mv_vg_label_adds`. Labels resolvidas por `labels_gitlab.name` (fallback `label_name_snapshot`), normalizadas com `lower(btrim())`: labels homônimas de escopos diferentes contam como a mesma.
+- **Atualização**: `vg_refresh_metrics()` chamada pelo `gitlab-sync-orchestrator` quando a fase `label_events` termina (falha vira nota no run, sem interromper o ciclo) e pelo `pg_cron` `vg_refresh_metrics` a cada 15 min. Refresh completo ≈ 1 s com os dados de 2026-10-17.
+- **Leitura**: views `vw_vg_*` filtradas por `is_company_member(auth.uid(), integrations_gitlab.company_id)` e RPCs `vg_*` `SECURITY INVOKER`. As tabelas `*_gitlab` seguem sem acesso de cliente.

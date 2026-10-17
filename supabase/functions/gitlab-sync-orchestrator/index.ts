@@ -376,6 +376,20 @@ Deno.serve(async (req: Request) => {
       }
     }
 
+    // Visão Gerencial: recalcula as views materializadas (ciclos, passagens e
+    // labels) quando a fase de eventos termina. Falha aqui não interrompe o ciclo;
+    // o pg_cron (vg_refresh_metrics a cada 15 min) cobre a próxima atualização.
+    if (stage === "label_events" && phaseAfter === "idle") {
+      const { error: refreshError } = await db.rpc("vg_refresh_metrics");
+      if (refreshError) {
+        console.error("vg_refresh_metrics", refreshError.message);
+        note = [note, `Falha ao atualizar métricas da Visão Gerencial: ${refreshError.message}`]
+          .filter(Boolean).join(" | ");
+      } else {
+        note = [note, "Métricas da Visão Gerencial atualizadas"].filter(Boolean).join(" | ");
+      }
+    }
+
     const end = iso();
     const runUpdate = await db.from("orchestrator_runs_gitlab")
       .update({ status: "succeeded", finished_at: end, http_status: httpStatus,
